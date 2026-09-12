@@ -22,10 +22,139 @@ def _after_alt_release(fn, *args):
     except Exception:
         pass
 
+def _strip_skeleton_section(text):
+    """vision 答案里的【框架】节（规则4：模型抄录的题目自带框架代码）拆出来。
+    返回 (去掉该节的剩余文本, 框架行列表)；无【框架】节 → (原文本, None)。
+    节边界 = 下一个【…】节头；框架行 = 节内代码块本体（无围栏则整节逐行）"""
+    import re as _re
+    heads = [(m.start(), m.end(), m.group(1))
+             for m in _re.finditer(r"【([^】\n]{1,12})】", text)]
+    idx = next((i for i, h in enumerate(heads) if h[2] == "框架"), None)
+    if idx is None:
+        return text, None
+    start = heads[idx][1]
+    end = heads[idx + 1][0] if idx + 1 < len(heads) else len(text)
+    return text[:heads[idx][0]] + text[end:], _skeleton_lines(text[start:end])
+
+def _skeleton_lines(seg):
+    """框架节正文 → 非空行列表；「无」类占位 → None（题目无框架，不做跳过）"""
+    import re as _re
+    seg = seg.strip()
+    if not seg or _re.fullmatch(r"(无|没有|无自带框架)[。.]?", seg):
+        return None
+    lines = seg.splitlines()
+    fences = [i for i, ln in enumerate(lines) if ln.lstrip().startswith("```")]
+    if len(fences) >= 2:
+        lines = lines[fences[0] + 1:fences[-1]]
+    return [ln for ln in lines if ln.strip()]
+
+def _dedent_code(body):
+    """代码块去公共前缀缩进：模型把围栏整块带缩进输出（列表/引用语境）时每行都
+    多出一截空白，打进去缩进全错。空行不动，块内相对缩进不受影响"""
+    import textwrap
+    return textwrap.dedent(body)
+
+def _spaces_to_tabs(body):
+    """行首空格 4:1 换成一个制表符（余数空格保留）：模型常规 4 空格缩进 → 一个
+    Tab 就是一个缩进层级，实际宽度交给编辑器 tab 设置——用户要求缩进按一个
+    制表符的宽度。余数保留所以 2/6/10 空格等悬挂缩进不丢层级"""
+    lines = body.splitlines()
+    out = []
+    for ln in lines:
+        n = len(ln) - len(ln.lstrip(" "))
+        out.append("\t" * (n // 4) + ln.lstrip(" "))
+    return "\n".join(out)
+
+def _skip_skeleton_lines(body, skel):
+    """前缀/后缀逐行对齐跳过框架已有代码（空白折叠归一后比对）。
+    答案 = 头部文件级声明 + 框架 + 中间函数体：开头整段剥掉（#include/import/
+    using/typedef 等——要么框架里已有、要么平台运行器自动注入（力扣），光标在
+    函数体内打进去全是事故）、与框架对齐的类声明/函数签名/收尾大括号不重打；
+    中间函数体原样保留。不能按「行在框架里出现过就删」全局去重——函数体内
+    if/for 的 } 归一后与框架 } 相同，全局删直接把结构删坏。占位行 pass/注释
+    不参与比对（函数体内同名行可能是真代码）"""
+    import re as _re
+    _PP = ("#include", "#import", "#define", "#pragma", "#if",
+           "#endif", "#ifdef", "#ifndef", "#elif", "#else")
+    def _norm(ln):
+        return _re.sub(r"\s+", " ", ln.strip())
+    def _is_header(s):
+        if s.startswith(_PP) or s.startswith(("using namespace", "using std::",
+                                              "typedef", "extern")):
+            return True
+        if _re.match(r"^(import |from )", s) or s.startswith(("//", "/*", "*")):
+            return True
+        return s.startswith("#")                    # 其余 # 开头 = 注释/预处理器
+    bl = body.splitlines()
+    while bl and (not bl[0].strip() or _is_header(bl[0].strip())):
+        bl.pop(0)                                    # 头部文件级声明整段剥掉
+    sl = []
+    for ln in skel:
+        n = _norm(ln)
+        if not n:
+            continue
+        if n == "pass" or n.startswith(("//", "/*", "*")):
+            continue                        # 占位/注释行不参与比对
+        if n.startswith("#") and not n.startswith(_PP):
+            continue                        # Python 注释；C/C++ 预处理器行必须保留
+        sl.append(n)
+    _DEF = _re.compile(r"^[\w][\w:<>,&*\[\]\s]*\s[\w~]+\s*\([^;{}]*\)\s*(const\s+)?\{")
+    def _has_outside_defs():
+        """答案含框架外的函数定义行（ACM 辅助函数/结构体写在 main 外等）→
+        跳到一半会把结构打残：退回整段打，用户清空编辑器从头打"""
+        for ln in bl:
+            n = _norm(ln)
+            if n in sl:
+                continue
+            if _DEF.match(n) or n.startswith(("class ", "struct ", "union ")):
+                return True
+        return False
+    if _has_outside_defs():
+        print("⚠️ 答案含框架外的函数定义（辅助函数/结构体），自动跳过取消："
+              "建议清空编辑器后从头打", flush=True)
+        return body
+    def _prefix_end():
+        lo, si, miss = 0, 0, 0
+        while lo < len(bl) and si < len(sl):
+            b = _norm(bl[lo])
+            if not b:                       # 前缀空行顺带跳过（框架空行不必重打）
+                lo += 1
+                continue
+            if b == sl[si]:
+                lo, si, miss = lo + 1, si + 1, 0
+                continue
+            si += 1                          # 框架行被模型省略（注释块等）→ 前进重试
+            miss += 1
+            if miss > 4:                     # 连续对不上：函数体开头，前缀阶段结束
+                break
+        return lo
+    def _suffix_end():
+        hi, si, miss = len(bl), len(sl) - 1, 0
+        while hi > 0 and si >= 0:
+            b = _norm(bl[hi - 1])
+            if not b:
+                hi -= 1
+                continue
+            if b == sl[si]:
+                hi, si, miss = hi - 1, si - 1, 0
+                continue
+            si -= 1
+            miss += 1
+            if miss > 4:
+                break
+        return hi
+    lo, hi = _prefix_end(), _suffix_end()
+    if lo >= hi:                             # 答案⊆框架（模型只回了框架）→ 无可打
+        return ""
+    return "\n".join(bl[lo:hi])
+
 def _type_prep(text):
     """打字/粘贴前的答案净化（clippy 用 syntax_tree 解析 markdown 的精简版）：
     带 ``` 代码块 → 只取最后一段代码块本体（笔试目标是代码编辑器，思路文字/围栏
-    打进去全是事故）；无代码块（简答/聊天框）→ 去围栏行、剥 ** 与反引号，正文保留"""
+    打进去全是事故）；无代码块（简答/聊天框）→ 去围栏行、剥 ** 与反引号，正文保留。
+    代码块本体再收三道：剥【框架】节（题目自带框架 → 前缀/后缀对齐跳过已有行，
+    头文件/声明不重复写入）、去公共前缀缩进、行首空格 4:1 换制表符（缩进按一个
+    制表符的宽度）"""
     if not text:
         return ""
     if text.startswith("（") and "）" in text[:40]:      # 剥「（整图没答出…）」类括注前缀
@@ -33,11 +162,16 @@ def _type_prep(text):
     text = text.strip()
     if not text:
         return ""
+    text, skeleton = _strip_skeleton_section(text)   # 【框架】节先拆出（无则 None）
     lines = text.splitlines()
     fences = [i for i, ln in enumerate(lines) if ln.lstrip().startswith("```")]
     if len(fences) >= 2:                                # 有围栏：取最后一段代码块内容
-        body = "\n".join(lines[fences[-2] + 1:fences[-1]]).strip()
-        if body:
+        body = "\n".join(lines[fences[-2] + 1:fences[-1]])
+        if body.strip():
+            body = _dedent_code(body).strip()           # 先 dedent 再 strip：strip 先跑会吃掉首行缩进
+            body = _spaces_to_tabs(body)
+            if skeleton:
+                body = _skip_skeleton_lines(body, skeleton)
             return body
     out = []
     for ln in lines:                                    # 无代码块：正文剥轻量 markdown
@@ -76,6 +210,8 @@ def type_answer_into_foreground(text):
     变速——比旧版全速 30-90ms 注入慢 40% 但更像人手，浏览器/编辑器不易丢字符。
     全字符走 KEYEVENTF_UNICODE 注入（wVk=0）：中英文/符号通用、免 shift 状态，
     也不产生真实 VK——不会被自家 GetAsyncKeyState 轮询误触发。
+    代码模式：行首空白全部剥掉，缩进交给编辑器自动缩进（宽度=编辑器一个制表符；
+    带缩进打进自动缩进的编辑器会逐层叠加变宽）；框架已有行经 _type_prep 跳过。
     目标窗口 title 变化（弹窗/切走）立即停。手动停/焦点停后自动重新就绪（armed），
     再按 Alt+1 从头重打——旧版停完 armed=False 死锁：想重打没入口"""
     import ctypes as _c
@@ -100,6 +236,11 @@ def type_answer_into_foreground(text):
             log_event({"type": "typing_error", "err": "净化后无内容可打"})
             _rearm("净化后为空")
             return
+        if mode == "code":
+            # 行首空白全部交给编辑器：真实回车后 CodeMirror/VS Code 会按上下文
+            # 自动缩进（单位正是编辑器的一个制表符宽度），再打模型的行首空格会
+            # 叠在自动缩进上——每层越叠越宽，就是「缩进太多」的根因
+            text = "\n".join(ln.lstrip() for ln in text.splitlines())
         class _KBD(_c.Structure):
             _fields_ = [("wVk", _c.c_ushort), ("wScan", _c.c_ushort),
                         ("dwFlags", _c.c_uint), ("time", _c.c_uint),
@@ -166,8 +307,8 @@ def type_answer_into_foreground(text):
                 _key(0x0D, 0, 0)
                 _key(0x0D, 0, 2)
             elif ch == "\t":
-                for _ in range(4):
-                    _char(" ")
+                _key(0x09, 0, 0)                        # 真实 Tab 键：缩进宽度交给编辑器
+                _key(0x09, 0, 2)                        # tab 设置（一个制表符，不打 4 空格）
             elif ch != "\r":
                 _char(ch)
             i += 1
