@@ -89,8 +89,14 @@ def _vision_parse(j):
         return None                                 # 纯思考流（deepseek-v4 实测）→ 当没答案，交给上层报清晰错误
     except Exception:
         try:                                        # responses 格式（火山新接口）
-            out = j["output"]
-            return "".join(c.get("text", "") for c in out[0]["content"] if isinstance(c, dict))
+            texts = []
+            for o in j.get("output", []):
+                if not isinstance(o, dict) or o.get("type") == "reasoning":
+                    continue        # seed-2.1 推理块排在 output[0]：思考过程不是答案，跳过
+                for c in o.get("content", []):
+                    if isinstance(c, dict):
+                        texts.append(c.get("text", ""))
+            return "".join(texts)
         except Exception:
             return None
 
@@ -125,7 +131,9 @@ def _ask_vision_multi(key, model, url, parts, prompt, max_tokens):
              "image_url": {"url": f"data:image/jpeg;base64,{b}"}} for b in b64s]
     body = {"model": model, "messages": [{"role": "user",
             "content": imgs + [{"type": "text", "text": prompt}]}], "max_tokens": max_tokens}
-    r = requests.post(url, headers=hdr, json=body, timeout=60)
+    # 超时 (15, 120)：多轮记忆大请求 + 新模型首 token 慢，60s 单值实测被
+    # HTTPConnectionPool 超时打爆（2026-09-12 用户高频复现）——对齐 chat.py 写法
+    r = requests.post(url, headers=hdr, json=body, timeout=(15, 120))
     if r.status_code == 200:
         return _vision_parse(r.json()), 200
     if r.status_code in (400, 404):                 # chat 格式/模型入口被拒 → 回退 responses 格式
@@ -133,7 +141,7 @@ def _ask_vision_multi(key, model, url, parts, prompt, max_tokens):
             [{"type": "input_image",
               "image_url": f"data:image/jpeg;base64,{b}"} for b in b64s] +
             [{"type": "input_text", "text": prompt}]}]}
-        r2 = requests.post(VISION_FALLBACK_URL, headers=hdr, json=body2, timeout=60)
+        r2 = requests.post(VISION_FALLBACK_URL, headers=hdr, json=body2, timeout=(15, 120))
         if r2.status_code == 200:
             return _vision_parse(r2.json()), 200
         return None, r2.status_code
@@ -142,6 +150,19 @@ def _ask_vision_multi(key, model, url, parts, prompt, max_tokens):
 def _ask_vision_once(key, model, url, img, prompt, max_tokens):
     """单张 PIL 图入口（保留旧签名兼容）→ 走多图核心"""
     return _ask_vision_multi(key, model, url, [img], prompt, max_tokens)
+
+def _ask_vision_retry(key, model, url, parts, prompt, max_tokens):
+    """识图带一次自动重试：HTTPConnectionPool 超时（大图+多轮记忆请求重、模型端
+    慢/不稳）是「识图异常」最常见根因，重试一次多半能成；重试仍超时再抛给上层"""
+    import requests
+    for attempt in (1, 2):
+        try:
+            return _ask_vision_multi(key, model, url, parts, prompt, max_tokens)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            if attempt == 2:
+                raise
+            log_event({"type": "vision_retry", "why": type(e).__name__,
+                       "err": str(e)[:120]})
 
 def do_vision(ui):
     """Alt+P 识图主流程（后台线程）：全屏截图 →（自动带上同题历史截图+上次解答）→ 识图 API →
@@ -155,6 +176,7 @@ def do_vision(ui):
         url = _env_get("VISION_BASE_URL") or VISION_BASE_URL   # 可在 .env 换服务商
         from PIL import Image, ImageGrab
         import time as _time
+        t0 = _time.time()
         ui("ov_ctl", "hide")                        # 置顶窗先离场：它会被截进图，模型看见「Alt+P截」等字样拒答
         try:
             _time.sleep(0.35)                       # 等 Tk 主线程 withdraw + 合成一帧
@@ -170,12 +192,12 @@ def do_vision(ui):
         parts = _vis_mem_parts() + [img]
         prompt = profiles.ACTIVE.vision_prompt + _vis_mem_prompt_suffix()   # 收敛：原 VISION_PROMPT const
         mem_n = len(VIS_MEM["imgs"])
-        ans, st = _ask_vision_multi(key, model, url, parts, prompt,
+        ans, st = _ask_vision_retry(key, model, url, parts, prompt,
                                     profiles.ACTIVE.vision_max_tokens)      # 收敛：原 VISION_MAX_TOKENS const
         if not ans:                                 # 整图（含历史）没答出来 → 中央裁剪放大再看一眼
             ui("status", "🔍 整图没认出，放大题目重看中…")
             zoom = _crop_center_zoom(img)
-            ans2, st2 = _ask_vision_multi(key, model, url, _vis_mem_parts() + [zoom],
+            ans2, st2 = _ask_vision_retry(key, model, url, _vis_mem_parts() + [zoom],
                                           prompt, profiles.ACTIVE.vision_max_tokens)
             if ans2:
                 ans = f"（整图没答出，放大重看）\n{ans2}"
@@ -189,8 +211,11 @@ def do_vision(ui):
                    "err": None if (ans and not ans.startswith("❌")) else (ans or "")[:200],
                    "answer": ans[:2000], "ans_len": len(ans or ""),
                    "truncated": bool(ans) and len(ans) > 2000,
-                   "mem_imgs": mem_n, "mem_ans": len(VIS_MEM["ans"])})
+                   "mem_imgs": mem_n, "mem_ans": len(VIS_MEM["ans"]),
+                   "api_sec": round(_time.time() - t0, 2)})
     except Exception as e:
+        # 2026-09-12 起落盘：原只弹状态栏，静默启动下「识图失败」在日志里零痕迹
+        log_event({"type": "vision_error", "err": f"{type(e).__name__}: {e}"[:200]})
         ui("status", f"❌ 识图异常: {e}")
     finally:
         VISION_STATE["busy"] = False
